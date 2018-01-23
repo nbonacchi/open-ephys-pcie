@@ -21,9 +21,9 @@ const size_t fifo_frame_capacity = 1000;
 // Config registers
 volatile oe_reg_val_t running = 0;
 const oe_reg_val_t sys_clock_hz = 100e6;
-oe_reg_val_t clock_m = 1;
-oe_reg_val_t clock_d = 10000; // These vals give 10 kHz
-volatile oe_reg_val_t fs_hz;
+
+// Hardcoded for testing
+float ts_sec = 1.0/10e6;
 
 // Global state
 volatile uint64_t sample_tick = 0;
@@ -66,9 +66,7 @@ typedef enum oe_conf_reg_off {
     CONFRUNNINGOFFSET   = 20,  // Configuration run hardware register byte offset
     CONFRESETOFFSET     = 24,  // Configuration reset hardware register byte offset
     CONFSYSCLKHZOFFSET  = 28,  // Configuration base clock frequency register byte offset
-    CONFFSCLKHZOFFSET   = 32,  // Configuration frame clock frequency register byte offset
-    CONFFSCLKMOFFSET    = 36,  // Configuration run hardware register byte offset
-    CONFFSCLKDOFFSET    = 40,  // Configuration run hardware register byte offset
+
 } oe_conf_reg_off_t;
 
 // Devices handled by this firmware
@@ -140,14 +138,6 @@ uint32_t get_write_frame_size(oe_device_t *dev_map, int *devs, size_t n_devs)
     return write_frame_size;
 }
 
-size_t div_clock(size_t base_freq_hz, uint32_t M, uint32_t D)
-{
-    if (M >= D)
-        return base_freq_hz;
-    else
-        return (M * base_freq_hz)/D;
-}
-
 int read_config(int config_fd, oe_conf_reg_off_t offset, void *result, size_t size)
 {
     lseek(config_fd, offset, SEEK_SET);
@@ -166,7 +156,6 @@ void generate_default_config(int config_fd)
 {
     // Default config
     running = 0;
-    fs_hz = div_clock(sys_clock_hz, clock_m, clock_d);
     sample_tick = 0;
 
     // Just put a bunch of 0s in there
@@ -177,9 +166,6 @@ void generate_default_config(int config_fd)
     // Write defaults for registers that need it
     write_config(config_fd, CONFRUNNINGOFFSET, (void *)&running, sizeof(oe_reg_val_t));
     write_config(config_fd, CONFSYSCLKHZOFFSET, (void *)&sys_clock_hz, sizeof(oe_reg_val_t));
-    write_config(config_fd, CONFFSCLKHZOFFSET, (void *)&fs_hz, sizeof(oe_reg_val_t));
-    write_config(config_fd, CONFFSCLKMOFFSET, (void *)&clock_m, sizeof(oe_reg_val_t));
-    write_config(config_fd, CONFFSCLKDOFFSET, (void *)&clock_d, sizeof(oe_reg_val_t));
 }
 
 int send_msg_signal(int sig_fd, oe_signal_t type)
@@ -240,87 +226,84 @@ void send_device_map(int sig_fd)
 
 void *data_loop(void *vargp)
 {
-    // Initial clock conifig
-    fs_hz = div_clock(sys_clock_hz, clock_m, clock_d);
-
     // Set data pipe capacity
     // Sample number, LFP data, ...
     fcntl(data_fd, F_SETPIPE_SZ, approx_frame_size * fifo_frame_capacity);
 
-    //const int fudge_factor = 1;
-
     while (!quit) {
         if (running) {
 
-            //usleep(1e6 / fs_hz - fudge_factor); // Simulate finite sampling time
-
             // Raw frame
             uint8_t * frame;
-            uint16_t num_devs;
             size_t data_block_size = 0;
             size_t frame_size;
-            if (sample_tick % 100 == 0) { // Include IMU data
-                num_devs = 3;
-                int dev_idxs[] = {0, 1, 2};
-                int i;
-                for (i = 0; i < num_devs; i++)
-                    data_block_size += my_devices[dev_idxs[i]].read_size;
+            int dev_idxs[] = {0, 1, 2};
+            uint16_t num_devs = (sample_tick % 100 == 0 ? 3 : 2); // Include IMU data?
 
-                frame_size
-                    = get_read_frame_size(my_devices, dev_idxs, num_devs);
-                frame = malloc(frame_size);
+            // Allocate Frame
+            int i;
+            for (i = 0; i < num_devs; i++)
+                data_block_size += my_devices[dev_idxs[i]].read_size;
 
-                // Device indicies
-                *(((uint32_t *)(frame + OE_RFRAMEHEADERSZ)) + 0) = 0;
-                *(((uint32_t *)(frame + OE_RFRAMEHEADERSZ)) + 1) = 1;
-                *(((uint32_t *)(frame + OE_RFRAMEHEADERSZ)) + 2) = 2;
+            frame_size
+                = get_read_frame_size(my_devices, dev_idxs, num_devs);
+            frame = malloc(frame_size);
 
-            } else {
-                num_devs = 2;
-                int dev_idxs[] = {0, 1};
-                int i;
-                for (i = 0; i < num_devs; i++)
-                    data_block_size += my_devices[dev_idxs[i]].read_size;
-
-                frame_size
-                    = get_read_frame_size(my_devices, dev_idxs, num_devs);
-                frame = malloc(frame_size);
-
-                // Device indicies
-                *(((uint32_t *)(frame + OE_RFRAMEHEADERSZ)) + 0) = 0;
-                *(((uint32_t *)(frame + OE_RFRAMEHEADERSZ)) + 1) = 1;
-            }
-
-            // Frame header
+            // Write frame header
             *(uint64_t *)frame = sample_tick;                      // Sample number
             *((uint16_t *)(frame + OE_RFRAMENDEVOFF)) = num_devs;  // Num devices
             *(frame + OE_RFRAMENERROFF) = 0;                       // Error
 
-            // Where does the data block start and end
+            // Add device indicies
+            for (i = 0; i < num_devs; i++)
+                *(((uint32_t *)(frame + OE_RFRAMEHEADERSZ)) + i) = i;
+
+            // Find data block start
             uint8_t *data_ptr
                 = frame + (OE_RFRAMEHEADERSZ + num_devs * sizeof(uint32_t));
-            uint8_t *data_end = data_ptr + data_block_size;
+
+
+            // Loop through each device and have it "produce" some data
+            int k = 0; // Global "source" index
+            for (i = 0; i < num_devs; i++) {
+
+                // Data end point for this device
+                uint8_t *data_end
+                    = data_ptr + my_devices[dev_idxs[i]].read_size;
+
+                int dev_id = my_devices[dev_idxs[i]].id;
+                switch (dev_id) {
+
+                    case OE_RHD2164:
+                    case OE_RHD2132: {
+                        while (data_ptr < data_end) {
+                            double t = sample_tick * ts_sec;
+                            double freq = k++ * 3 + 100;
+                            double samp
+                                = 10000 * sin(2 * M_PI * freq * t) + 32768;
+                            *(uint16_t *)(data_ptr) = samp;
+                            data_ptr += 2;
+                        }
+                        break;
+                    }
+                    case OE_MPU9250:
+                        while (data_ptr < data_end) {
+                            //double t = sample_tick * ts_sec;
+                            //double freq = k++ * 3 + 100;
+                            double samp = randn(0, 1000);// + 10000 * sin(2 * M_PI * freq * t) + 32768;
+                            *(uint16_t *)(data_ptr) = samp;
+                            data_ptr += 2;
+                        }
+                        break;
+                }
+            }
 
             // Generate frame
             // TODO: Generate the proper raw type for the device
-            while (data_ptr < data_end) {
-                *(uint16_t *)(data_ptr) = sample_tick % 65535;
-                data_ptr += 2;
-                if (data_ptr >= data_end)
-                    break;
-                *(uint16_t *)(data_ptr) = 65535 - (sample_tick % 65535);
-                data_ptr += 2;
-                if (data_ptr >= data_end)
-                    break;
-                *(uint16_t *)(data_ptr) = 65535 * (sample_tick % 2);
-                data_ptr += 2;
-                if (data_ptr >= data_end)
-                    break;
-            }
 
             size_t rc = write(data_fd, frame, frame_size);
             assert(rc == frame_size && "Incomplete write.");
-            //printf("Write %zu bytes\n", rc);
+            // printf("Write %zu bytes\n", rc);
 
             // Increment frame count
             sample_tick += 1;
@@ -388,12 +371,6 @@ reset:
             write_config(config_fd, CONFRESETOFFSET, &reset, 4);
             goto reset;
         }
-
-        // Sample rate
-        read_config(config_fd, CONFFSCLKMOFFSET, &clock_m, 4);
-        read_config(config_fd, CONFFSCLKDOFFSET, &clock_d, 4);
-        fs_hz = div_clock(sys_clock_hz, clock_m, clock_d);
-        write_config(config_fd, CONFFSCLKHZOFFSET, (void *)&fs_hz, 4);
 
         // -- Device configuration Interface --
         // Poll configuration registers

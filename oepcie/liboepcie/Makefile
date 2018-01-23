@@ -5,7 +5,7 @@ DNAMELN :=  $(NAME).so
 HDR     :=  $(wildcard *.h)
 SRC     :=  $(wildcard *.c)
 OBJ     :=  $(SRC:.c=.o)
-CFLAGS  :=  -pedantic -Wall -W -Werror -g -g3 -fPIC -O3
+CFLAGS  :=  -pedantic -Wall -W -Werror -g -g3 -fPIC -O0
 LDFLAGS :=  -L.
 PREFIX  := /usr/local
 

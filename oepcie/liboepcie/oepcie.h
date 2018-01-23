@@ -51,11 +51,13 @@ typedef uint32_t oe_raw_t;
 
 // Device type
 typedef struct {
-    oe_dev_id_t id;       // ID number; NB: Cannot use oe_device_id_t because this must be fixed width
-    oe_size_t read_size;  // read size in bytes
-    oe_raw_t read_type;   // read type
-    oe_size_t write_size; // write size in bytes
-    oe_raw_t write_type;  // write type
+    oe_dev_id_t id;             // ID number; NB: Cannot use oe_device_id_t because this must be fixed width
+    oe_size_t read_size;        // Read size in bytes
+    oe_raw_t read_type;         // Read type
+    //oe_size_t reads_per_sample; // Number of frames needed to produce one sample
+    oe_size_t write_size;       // Write size in bytes
+    oe_raw_t write_type;        // Write type
+    //oe_size_t writes_per_sample;// Number of frames needed to produce one sample
 
 } oe_device_t;
 
@@ -118,9 +120,11 @@ enum {
     OE_EREADONLY        = -20, // Attempted write to read only object (register, context option, etc)
     OE_ERUNSTATESYNC    = -21, // Software and hardware run state out of sync
     OE_EINVALRAWTYPE    = -22, // Invalid raw data type
+    OE_ETHREAD          = -23, // Error during thread creation
+    OE_EFIFOINIT        = -24, // Unable to initalize RAM FIFO
 
     // NB: Always at bottom
-    OE_MINERRORNUM      = -23
+    OE_MINERRORNUM      = -25
 };
 
 // Context

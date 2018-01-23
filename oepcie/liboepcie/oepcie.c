@@ -7,12 +7,16 @@
 #include "unistd.h"
 
 #include "oepcie.h"
+#include "fifo.h"
 
 // Non-public fixed width types
 typedef uint32_t oe_reg_val_t;
 
 // Register size
 #define OE_REGSZ   sizeof(oe_reg_val_t)
+
+// RAM FIFO size 
+#define OE_FIFOSZ 2048
 
 // Define if hardware produces byte-reversed types from compile command
 #ifdef OE_BIGEND
@@ -62,6 +66,13 @@ typedef struct oe_ctx_impl {
     oe_size_t max_read_frame_size;
     oe_size_t max_write_frame_size;
 
+    // RAM FIFO
+    //size_t fifo_ready_bytes;
+    //struct xillyinfo fifo_info;
+    struct xillyfifo fifo;
+    pthread_t fifo_thread;
+    //uint8_t *input_buffer;
+
     // Acqusition state
     enum {
         CTXNULL = 0,
@@ -108,6 +119,7 @@ typedef enum oe_conf_reg_off {
 
 // Static helpers
 static inline int _oe_read(int data_fd, void* data, size_t size);
+static void *_oe_data_thread(void *arg);
 static inline int _oe_read_signal_packet(int signal_fd, uint8_t *buffer);
 static int _oe_read_signal_data(int signal_fd, oe_signal_t *type, void *data, size_t size);
 static int _oe_pump_signal_type(int signal_fd, int flags, oe_signal_t *type);
@@ -120,6 +132,7 @@ static int _oe_read_config(int config_fd, oe_conf_off_t read_offset, oe_reg_val_
 static int _oe_array_bswap(void *data, oe_raw_t type, size_t size);
 static int _device_map_byte_swap(oe_ctx ctx);
 #endif
+
 
 oe_ctx oe_create_ctx()
 {
@@ -146,9 +159,14 @@ int oe_init_ctx(oe_ctx ctx)
     assert(ctx != NULL && "Context is NULL.");
     assert(ctx->run_state == UNINITIALIZED && "Context is in invalid state.");
 
-    if(ctx->run_state != UNINITIALIZED)
+    if (ctx->run_state != UNINITIALIZED)
         return OE_EINVALSTATE;
 
+    // Make the read fifo (should happen before opening an asychronous stream)
+    if (fifo_init(&ctx->fifo, OE_FIFOSZ))
+        return OE_EFIFOINIT;
+
+    // Open all communication channels
     ctx->config.fid = open(ctx->config.path, O_RDWR);
     if (ctx->config.fid == -1)
         return OE_EPATHINVALID;
@@ -233,6 +251,11 @@ int oe_init_ctx(oe_ctx ctx)
 #ifdef OE_BE
         _device_map_byte_swap(ctx);
 #endif
+
+    // Start the data input thread
+    rc = pthread_create(&ctx->fifo_thread, NULL, _oe_data_thread, ctx);
+    if (rc) return OE_ETHREAD;
+
     // We are now initialized and idle
     ctx->run_state = IDLE;
 
@@ -243,6 +266,7 @@ int oe_destroy_ctx(oe_ctx ctx)
 {
     assert(ctx != NULL && "Context is NULL");
 
+    // Close open file descriptors
     if (ctx->run_state >= IDLE) {
 
         if (close(ctx->config.fid) == -1) goto oe_close_ctx_fail;
@@ -250,6 +274,11 @@ int oe_destroy_ctx(oe_ctx ctx)
         if (close(ctx->signal.fid) == -1) goto oe_close_ctx_fail;
     }
 
+    // Join the FIFO thread
+    pthread_join(ctx->fifo_thread, NULL);
+
+    // Free dynamically allocated resources
+    fifo_destroy(&ctx->fifo);
     free(ctx->config.path);
     free(ctx->read.path);
     free(ctx->signal.path);
@@ -561,7 +590,7 @@ int oe_read_reg(const oe_ctx ctx,
 // 1. DMA FIFO Buffer is overflowing
 // 2. Small calls to read() impact RT performance
 // 3. etc
-// Then we can implement multithreaded RAM FIFO using fifo.c in Xillybus demo
+// Then we can implement multithreaded RAM FIFO using _fifo.c in Xillybus demo
 // code as an example
 int oe_read_frame(const oe_ctx ctx, oe_frame_t **frame_in)
 {
@@ -571,10 +600,29 @@ int oe_read_frame(const oe_ctx ctx, oe_frame_t **frame_in)
     // a different thread
     assert(ctx->run_state >= IDLE && "Context is not acquiring.");
 
+    // NB: This loop should not spin because fifo_request_drain waits until
+    // data is in the _fifo to return.
+    size_t ready_bytes, used_bytes = 0;
+    struct xillyinfo fifo_info;
+    uint8_t * buf;
+
+    // Drain the _fifo until we get at least a single frame
+drain:
+    ready_bytes = fifo_request_drain(&ctx->fifo, &fifo_info);
+    if (ready_bytes < ctx->max_read_frame_size)
+        goto drain;
+
+    buf = fifo_info.addr;
+
     // Get the header and figure out how many devies are in the frame
     uint8_t header[OE_RFRAMEHEADERSZ];
-    int rc = _oe_read(ctx->read.fid, header, OE_RFRAMEHEADERSZ);
-    if (rc != OE_RFRAMEHEADERSZ) return OE_EREADFAILURE;
+    //int rc = _oe_read(ctx->read.fid, header, OE_RFRAMEHEADERSZ);
+    memcpy(header, buf, OE_RFRAMEHEADERSZ);
+    used_bytes += OE_RFRAMEHEADERSZ;
+    buf += OE_RFRAMEHEADERSZ;
+
+
+    //if (rc != OE_RFRAMEHEADERSZ) return OE_EREADFAILURE;
 
     // Allocate frame
     *frame_in= malloc(sizeof(oe_frame_t));
@@ -596,8 +644,11 @@ int oe_read_frame(const oe_ctx ctx, oe_frame_t **frame_in)
     frame->dev_offs = malloc(frame->dev_offs_sz);
 
     // Read device indices that are in this frame
-    rc = _oe_read(ctx->read.fid, frame->dev_idxs, frame->dev_idxs_sz);
-    assert((size_t)rc == frame->dev_idxs_sz && "Did not read full dev idxs buffer.");
+    //rc = _oe_read(ctx->read.fid, frame->dev_idxs, frame->dev_idxs_sz);
+    memcpy(frame->dev_idxs, buf, frame->dev_idxs_sz);
+    used_bytes += frame->dev_idxs_sz;
+    buf += frame->dev_idxs_sz;
+    //assert((size_t)rc == frame->dev_idxs_sz && "Did not read full dev idxs buffer.");
 
     // Find data read size
     uint16_t i;
@@ -619,8 +670,14 @@ int oe_read_frame(const oe_ctx ctx, oe_frame_t **frame_in)
     frame->data = malloc(rsize);
 
     // Read data
-    rc = _oe_read(ctx->read.fid, frame->data, rsize);
-    assert(rc == rsize && "Did not read full data buffer.");
+    //rc = _oe_read(ctx->read.fid, frame->data, rsize);
+    //assert(rc == rsize && "Did not read full data buffer.");
+
+    memcpy(frame->data, buf, rsize);
+    used_bytes += rsize;
+
+    //ctx->fifo_ready_bytes -= used_bytes;
+    fifo_drained(&ctx->fifo, used_bytes);
 
     // TODO: Endianess swap based on each device's raw type
 //#ifdef OE_BE
@@ -737,6 +794,12 @@ const char *oe_error_str(int err)
         case OE_EINVALRAWTYPE: {
             return "Invalid raw data type";
         }
+        case OE_ETHREAD: {
+            return "Error during thread creation";
+        }
+        case OE_EFIFOINIT: {
+            return "Unable to initalize RAM FIFO";
+        }
         default:
             return "Unknown error";
     }
@@ -782,6 +845,47 @@ static inline int _oe_read(int data_fd, void *data, size_t size)
     }
 
     return received;
+}
+
+static void *_oe_data_thread(void *arg)
+{
+    oe_ctx ctx = arg;
+    //struct xillyfifo *fifo = c->fifo;
+    //int read_fd = &((oe_ctx_impl_t)arg)->read;
+    int read_bytes;
+    struct xillyinfo info;
+    unsigned char *buf;
+
+    while (1) {
+        int do_bytes = fifo_request_write(&ctx->fifo, &info);
+
+        if (do_bytes == 0)
+            return NULL;
+
+        for (buf = info.addr; do_bytes > 0;
+             buf += read_bytes, do_bytes -= read_bytes) {
+
+            read_bytes = read(ctx->read.fid, buf, do_bytes);
+
+            if ((read_bytes < 0) && (errno != EINTR)) {
+                perror("read() failed");
+                return NULL;
+            }
+
+            if (read_bytes == 0) {
+                // Reached EOF. Quit without complaining.
+                fifo_done(&ctx->fifo);
+                return NULL;
+            }
+
+            if (read_bytes < 0) { // errno is EINTR
+                read_bytes = 0;
+                continue;
+            }
+
+            fifo_wrote(&ctx->fifo, read_bytes);
+        }
+    }
 }
 
 static inline int _oe_read_signal_packet(int signal_fd, uint8_t *buffer)
